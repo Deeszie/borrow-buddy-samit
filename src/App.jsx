@@ -1,23 +1,30 @@
-import { useLayoutEffect, useState } from 'react'
+import { useLayoutEffect, useState, useEffect } from 'react'
 import './App.css'
 import LoanForm from './components/LoanForm.jsx'
 import LoanList from './components/LoanList.jsx'
 import SearchBox from './components/SearchBox.jsx'
 import ThemeToggle from './components/ThemeToggle.jsx'
+import LoginScreen from './components/LoginScreen.jsx'
 import { toIsoDate } from './lib/dateFormat.js'
 import { filterLoansByFriend, markReturned, unmarkReturned } from './lib/loanRules.js'
-import { loadLoans, saveLoans } from './lib/storage.js'
 import { getInitialTheme, saveTheme, toggleTheme } from './lib/theme.js'
+import { supabase } from './lib/supabaseClient.js'
 
 const createId = () =>
   globalThis.crypto?.randomUUID?.() ??
   `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
 
 function App() {
-  // โหลดครั้งเดียวตอนเปิดหน้า (อ่านอย่างเดียว ไม่เขียนทับข้อมูลเดิม)
-  const [initial] = useState(loadLoans)
-  const [loans, setLoans] = useState(initial.loans)
-  const [warning, setWarning] = useState(initial.warning)
+  // สถานะการล็อกอิน
+  const [user, setUser] = useState(null)
+  const [authLoading, setAuthLoading] = useState(true)
+
+  // สถานะสำหรับข้อมูล Loan
+  const [loans, setLoans] = useState([])
+  const [warning, setWarning] = useState(null)
+  const [saving, setSaving] = useState(false)
+  const [fetchError, setFetchError] = useState(null)
+
   const [editingId, setEditingId] = useState(null)
   const [query, setQuery] = useState('')
   const [theme, setTheme] = useState(() =>
@@ -29,6 +36,117 @@ function App() {
     document.documentElement.dataset.theme = theme
   }, [theme])
 
+  // ตรวจสอบสถานะการล็อกอินตอนแรก
+  useEffect(() => {
+    const checkAuth = async () => {
+      const { data: { user } } = await supabase.auth.getUser()
+      if (user) {
+        setUser(user)
+      }
+      setAuthLoading(false)
+    }
+
+    checkAuth()
+
+    // ฟังเหตุการณ์การเปลี่ยนแปลงการล็อกอิน
+    const { data: authData } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null)
+    })
+
+    return () => {
+      if (authData && authData.subscription) {
+        authData.subscription.unsubscribe()
+      }
+    }
+  }, [])
+
+  // โหลด Loan จาก Supabase หลังล็อกอินสำเร็จ
+  useEffect(() => {
+    const loadLoansFromSupabase = async () => {
+      if (!user) {
+        setLoans([])
+        setFetchError(null)
+        return
+      }
+
+      setFetchError(null)
+      const { data, error } = await supabase
+        .from('loans')
+        .select('*')
+        .eq('owner_id', user.id)
+        .order('dueDate', { ascending: true })
+
+      if (error) {
+        console.error('Error fetching loans:', error)
+        setFetchError(`ไม่สามารถโหลดข้อมูลได้: ${error.message}`)
+        setLoans([])
+      } else if (data) {
+        setLoans(data)
+      }
+    }
+
+    loadLoansFromSupabase()
+  }, [user])
+
+  // ฟังก์ชันบันทึก Loan ไป Supabase ทีละรายการ
+  const saveLoanToSupabase = async (loan, user) => {
+    if (loan.id) {
+      // Update
+      const { error } = await supabase
+        .from('loans')
+        .update({ ...loan, owner_id: user.id })
+        .eq('id', loan.id)
+      return error
+    } else {
+      // Insert
+      const { error } = await supabase
+        .from('loans')
+        .insert({ ...loan, owner_id: user.id })
+      return error
+    }
+  }
+
+  // ฟังก์ชันจัดการกับการเปลี่ยนแปลง Loan
+  const changeLoans = async (nextLoans) => {
+    setLoans(nextLoans)
+
+    // บันทึกทันทีไป Supabase (แทน localStorage)
+    if (user) {
+      setSaving(true)
+
+      try {
+        // ลบข้อมูลเดิมของ user นี้ออกก่อน
+        await supabase.from('loans').delete().eq('owner_id', user.id)
+
+        // แล้ว insert ใหม่ทีละรายการ
+        for (const loan of nextLoans) {
+          await saveLoanToSupabase(loan, user)
+        }
+
+        setWarning(null)
+      } catch (err) {
+        console.error('Exception saving loans:', err)
+        setWarning(`บันทึกข้อมูลไม่สำเร็จ: ${err.message}`)
+      } finally {
+        setSaving(false)
+      }
+    }
+  }
+
+  const handleLoginSuccess = (user) => {
+    setUser(user)
+    setWarning(null)
+    setFetchError(null)
+  }
+
+  const handleLogout = async () => {
+    const { error } = await supabase.auth.signOut()
+    if (error) {
+      console.error('Logout error:', error)
+    }
+    setUser(null)
+  }
+
   const handleToggleTheme = () => {
     const next = toggleTheme(theme)
     setTheme(next)
@@ -39,14 +157,6 @@ function App() {
   const editingLoan = loans.find((loan) => loan.id === editingId) ?? null
   const visibleLoans = filterLoansByFriend(loans, query)
 
-  // ทุกการเปลี่ยน Loan ต้องผ่านฟังก์ชันนี้ เพื่อบันทึกทุกครั้งที่เปลี่ยน
-  // ไม่ใช้ useEffect เพราะจะเขียนรายการว่างทับข้อมูลเดิมที่อ่านไม่ได้ตอนเปิดหน้า
-  const changeLoans = (nextLoans) => {
-    setLoans(nextLoans)
-    setWarning(saveLoans(nextLoans))
-  }
-
-  // Loan ที่ยังไม่มี id คือเพิ่มใหม่ ถ้ามี id คือแก้ไขรายการเดิม
   const handleSave = (loan) => {
     if (loan.id) {
       changeLoans(loans.map((l) => (l.id === loan.id ? loan : l)))
@@ -64,13 +174,37 @@ function App() {
 
   const handleUnmarkReturned = (loan) => replaceLoan(loan, unmarkReturned)
 
+  // ถ้ายังโหลด auth อยู่ แสดง loading
+  if (authLoading) {
+    return (
+      <div className="app-loading">
+        <p>กำลังตรวจสอบสถานะการล็อกอิน...</p>
+      </div>
+    )
+  }
+
+  // ถ้ายังไม่ล็อกอิน แสดง LoginScreen
+  if (!user) {
+    return (
+      <LoginScreen onLoginSuccess={handleLoginSuccess} />
+    )
+  }
+
+  // หน้าหลักเมื่อล็อกอินแล้ว
   return (
     <main>
       <header className="app-header">
         <h1>Borrow Buddy</h1>
-        <ThemeToggle theme={theme} onToggle={handleToggleTheme} />
+        <div className="header-actions">
+          <span className="user-info">👤 {user.email}</span>
+          <button onClick={handleLogout} className="logout-btn">ออกจากระบบ</button>
+          <ThemeToggle theme={theme} onToggle={handleToggleTheme} />
+        </div>
       </header>
-      {warning && <p role="alert">{warning}</p>}
+
+      {(warning || fetchError) && <p role="alert" className="warning">{warning || fetchError}</p>}
+      {saving && <p className="saving-indicator">กำลังบันทึก...</p>}
+
       <LoanForm
         key={editingLoan?.id ?? 'new'}
         today={today}
